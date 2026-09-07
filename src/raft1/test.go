@@ -214,8 +214,7 @@ func (ts *Test) ApplyErr(i int, err string) {
 	tester.AnnotateCheckerFailureBeforeExit("apply error", err)
 }
 
-// check that none of the connected servers
-// thinks it is the leader.
+// 检查当前所有“仍然连接”的 Raft 节点，确保没有任何节点认为自己是 Leader。
 func (ts *Test) checkNoLeader() {
 	tester.AnnotateCheckerBegin("checking no unexpected leader among connected servers")
 	for i := 0; i < ts.n; i++ {

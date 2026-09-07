@@ -1,17 +1,31 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-import "os"
-
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"time"
+)
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
 	Key   string
 	Value string
 }
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
@@ -23,6 +37,138 @@ func ihash(key string) int {
 
 var coordSockName string // socket for coordinator
 
+func reportTask(taskType TaskType, taskID int) {
+	args := ReportTaskArgs{
+		TaskType: taskType,
+		TaskID:   taskID,
+	}
+	reply := ReportTaskReply{}
+
+	call("Coordinator.ReportTask", &args, &reply)
+}
+
+func doMapTask(task RequestTaskReply, mapf func(string, string) []KeyValue) {
+	//读取文件内容
+	content, err := os.ReadFile(task.FileName)
+	if err != nil {
+		log.Fatalf("cannot read %v: %v", task.FileName, err)
+	}
+	//转换键值对格式
+	kva := mapf(task.FileName, string(content))
+	//创建 Reduce 分区
+	buckets := make([][]KeyValue, task.NReduce)
+	for _, kv := range kva {
+		reduceID := ihash(kv.Key) % task.NReduce
+		buckets[reduceID] = append(buckets[reduceID], kv)
+	}
+
+	for reduceID, bucket := range buckets {
+		// Write to a temporary file first so a crash cannot leave a half-written
+		// mr-X-Y file for a reducer to consume.
+		finalName := fmt.Sprintf("mr-%d-%d", task.TaskID, reduceID)
+		tmpFile, err := os.CreateTemp(".", finalName+"-*")
+		if err != nil {
+			log.Fatalf("cannot create temp intermediate file: %v", err)
+		}
+
+		writer := bufio.NewWriter(tmpFile)
+		enc := json.NewEncoder(writer)
+		for _, kv := range bucket {
+			if err := enc.Encode(&kv); err != nil {
+				tmpFile.Close()
+				os.Remove(tmpFile.Name())
+				log.Fatalf("cannot encode intermediate key/value: %v", err)
+			}
+		}
+
+		if err := writer.Flush(); err != nil {
+			tmpFile.Close()
+			os.Remove(tmpFile.Name())
+			log.Fatalf("cannot flush intermediate file: %v", err)
+		}
+		if err := tmpFile.Close(); err != nil {
+			os.Remove(tmpFile.Name())
+			log.Fatalf("cannot close temp intermediate file: %v", err)
+		}
+		if err := os.Rename(tmpFile.Name(), finalName); err != nil {
+			os.Remove(tmpFile.Name())
+			log.Fatalf("cannot rename %v to %v: %v", tmpFile.Name(), finalName, err)
+		}
+	}
+}
+
+func doReduceTask(task RequestTaskReply, reducef func(string, []string) string) {
+	intermediate := []KeyValue{}
+
+	for mapID := 0; mapID < task.NMap; mapID++ {
+		fileName := fmt.Sprintf("mr-%d-%d", mapID, task.TaskID)
+		file, err := os.Open(fileName)
+		if err != nil {
+			log.Fatalf("cannot open intermediate file %v: %v", fileName, err)
+		}
+
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				if err == io.EOF {
+					break
+				}
+				file.Close()
+				log.Fatalf("cannot decode intermediate file %v: %v", fileName, err)
+			}
+			intermediate = append(intermediate, kv)
+		}
+
+		if err := file.Close(); err != nil {
+			log.Fatalf("cannot close intermediate file %v: %v", fileName, err)
+		}
+	}
+
+	sort.Sort(ByKey(intermediate))
+
+	finalName := fmt.Sprintf("mr-out-%d", task.TaskID)
+	tmpFile, err := os.CreateTemp(".", finalName+"-*")
+	if err != nil {
+		log.Fatalf("cannot create temp output file: %v", err)
+	}
+	writer := bufio.NewWriter(tmpFile)
+
+	for i := 0; i < len(intermediate); {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+
+		output := reducef(intermediate[i].Key, values)
+		if _, err := fmt.Fprintf(writer, "%v %v\n", intermediate[i].Key, output); err != nil {
+			tmpFile.Close()
+			os.Remove(tmpFile.Name())
+			log.Fatalf("cannot write reduce output: %v", err)
+		}
+
+		i = j
+	}
+
+	if err := writer.Flush(); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		log.Fatalf("cannot flush reduce output: %v", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		os.Remove(tmpFile.Name())
+		log.Fatalf("cannot close temp output file: %v", err)
+	}
+	if err := os.Rename(tmpFile.Name(), finalName); err != nil {
+		os.Remove(tmpFile.Name())
+		log.Fatalf("cannot rename %v to %v: %v", tmpFile.Name(), finalName, err)
+	}
+}
 
 // main/mrworker.go calls this function.
 func Worker(sockname string, mapf func(string, string) []KeyValue,
@@ -30,11 +176,32 @@ func Worker(sockname string, mapf func(string, string) []KeyValue,
 
 	coordSockName = sockname
 
-	// Your worker implementation here.
+	for {
+		args := RequestTaskArgs{}
+		reply := RequestTaskReply{}
 
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+		ok := call("Coordinator.RequestTask", &args, &reply)
+		if !ok {
+			time.Sleep(time.Second)
+			continue
+		}
 
+		switch reply.TaskType {
+		case MapTask:
+			doMapTask(reply, mapf)
+			reportTask(MapTask, reply.TaskID)
+
+		case ReduceTask:
+			doReduceTask(reply, reducef)
+			reportTask(ReduceTask, reply.TaskID)
+
+		case WaitTask:
+			time.Sleep(time.Second)
+
+		case ExitTask:
+			return
+		}
+	}
 }
 
 // example function to show how to make an RPC call to the coordinator.

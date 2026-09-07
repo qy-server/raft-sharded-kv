@@ -111,8 +111,8 @@ func (e *ClientEnd) SetCall(f Fcall) {
 // the return value indicates success; false means that
 // no reply was received from the server.
 func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bool {
-	if e.callf != nil {
-		rep, ok := e.callf(e.endname.(string), svcMeth, Marshall(args))
+	if e.callf != nil { //走模拟网络
+		rep, ok := e.callf(e.endname.(string), svcMeth, Marshall(args)) //服务器名字、RPC函数名、序列化参数
 		if !ok {
 			return false
 		}

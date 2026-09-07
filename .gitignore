@@ -1,2 +1,26 @@
 pkg/
 *-handin.tar.gz
+
+# Local IDE and operating-system files.
+/.idea/
+.DS_Store
+Thumbs.db
+
+# Generated binaries, test logs and profiles.
+*.exe
+*.test
+*.log
+*.prof
+*.pprof
+/coverage.out
+/coverage.html
+/src/coverage.out
+/src/coverage.html
+
+# MapReduce scratch directories and outputs, not source or input fixtures.
+/src/mr/mr-tmp*/
+/src/main/mr-tmp*/
+/src/mr/mr-out-*
+/src/main/mr-out-*
+/src/mr/mr-[0-9]*-[0-9]*
+/src/main/mr-[0-9]*-[0-9]*
